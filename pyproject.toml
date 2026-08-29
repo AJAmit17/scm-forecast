@@ -2,7 +2,7 @@
 name = "scm-forecast"
 version = "0.1.0"
 description = "Supply-chain demand forecasting + EBO-based inventory optimization (Excel in, CSV out)"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",

@@ -12,17 +12,24 @@ runs locally against the uploaded file (statsforecast/scipy are pure local
 compute). `.env` is not used by this project.
 
 ## Deployment (Streamlit Community Cloud)
-`runtime.txt` (`python-3.11`) and `packages.txt` (`libstdc++6`) at repo root are
-required for Streamlit Cloud specifically:
-- Without `runtime.txt`, Cloud picks the newest available Python (observed:
-  3.14), which is ahead of what statsforecast's compiled ARIMA extension
-  (`_lib.*.so`) has broadly-tested wheels for.
-- Without `libstdc++6`, importing that same compiled extension on Cloud's base
-  image fails with `undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE`
-  (the extension needs a newer libstdc++ than ships by default). This is a
-  Cloud-image issue, not an app bug - it does not reproduce locally under `uv`.
-If you change deployment target/runtime, re-verify this still resolves; do not
-remove these two files without confirming the import error is gone.
+Streamlit Cloud detects `uv.lock` and deploys via its **uv-sync** path, which
+picks the Python version itself (via `.python-version` / `requires-python`) -
+it does **not** read `runtime.txt` (that's only honored by the legacy
+pip/`requirements.txt` deploy path). The working fix is:
+- `.python-version` (`3.12`) + `requires-python = ">=3.11,<3.13"` in
+  `pyproject.toml` - pins uv to a Python version statsforecast has
+  broadly-tested wheels for. Without this, Cloud's uv-sync picked the newest
+  available Python (observed: 3.14), too new for statsforecast's compiled
+  ARIMA extension (`_lib.*.so`).
+- `packages.txt` (`libstdc++6`) - installs a current libstdc++ via apt before
+  pip/uv install. Without it, importing that same compiled extension fails
+  with `undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE` even on a
+  correctly-pinned Python.
+Both are Cloud-image issues, not app bugs - neither reproduces locally under
+`uv sync`. If you change deployment target/runtime, re-verify this still
+resolves before removing either file. `uv.lock` MUST be regenerated
+(`uv sync -p 3.12`) whenever `requires-python`/`.python-version` changes, or
+Cloud's uv-sync will reject a stale lock resolved against a different Python.
 
 ### Target input schema (real ERP/BI export)
 Monthly SKU demand history, one row per SKU x month:
