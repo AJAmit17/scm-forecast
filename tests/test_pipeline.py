@@ -99,3 +99,30 @@ def test_backtest_mape_reported_for_pipeline_output():
     outputs = run_pipeline(raw, _mapping_with_attrs(), config)
     # 90 daily periods is enough history for the backtest holdout to run
     assert outputs.inventory["backtest_mape"].notna().any()
+
+
+def test_sparse_seasonal_lumpy_sku_is_classified_lumpy_and_not_flattened():
+    """Regression guard: a SKU with a genuine recurring annual spike (e.g. a
+    once-a-year overhaul) amid mostly-zero months, with bimodal order sizes
+    (small routine orders vs. a rare huge one), must (a) actually land in the
+    SBC 'lumpy' bucket - a uniform size range does NOT (CV2 stays too low) -
+    and (b) not get flattened by an over-wide backtest holdout that starves
+    training data below what AutoETS/AutoARIMA need to detect the pattern."""
+    n = 36
+    dates = pd.date_range("2023-01-01", periods=n, freq="MS")
+    rng = np.random.default_rng(11)
+    y = np.zeros(n)
+    for m in [2, 8, 14, 20, 26, 32]:  # small recurring routine orders
+        y[m] = rng.integers(15, 40)
+    for m in [5, 17, 29]:  # rare large overhaul orders, annual cycle
+        y[m] = rng.integers(400, 800)
+    raw = pd.DataFrame({"sku": ["LUMPY-SEASONAL-1"] * n, "date": dates, "qty": y})
+
+    mapping = ColumnMapping(sku="sku", date="date", qty="qty")
+    config = PipelineConfig(freq="MS", horizon=18)
+
+    outputs = run_pipeline(raw, mapping, config)
+
+    assert outputs.inventory["category"].iloc[0] == "lumpy"
+    curve = outputs.forecast.sort_values("ds")["forecast_qty"].to_numpy()
+    assert curve.std() > 1.0, "forecast was flattened despite genuine recurring seasonal signal"

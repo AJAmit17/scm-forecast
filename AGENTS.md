@@ -116,8 +116,16 @@ src/scm_forecast/
   app.py        Streamlit UI: upload (cached via `st.cache_data`), column mapping, run,
                 model-selection/MAPE table, "Run log" expander, per-SKU forecast chart
                 (real curve, not a repeated average), two CSV downloads.
-scripts/generate_sample.py   synthetic demand generator (smooth/erratic/intermittent/
-                              lumpy/trending-seasonal SKUs, Item/YYMM/YYQQ/Actuals schema)
+scripts/generate_sample.py   synthetic demand generator: independently-seeded RNG per
+                              SKU (a shared stream made editing one series silently
+                              perturb another's draws), recurring seasonal windows for
+                              intermittent/lumpy series so there's real signal for the
+                              backtest to find, bimodal order sizes for lumpy (a uniform
+                              size range gives CV2 ~0.15-0.25 and never actually lands in
+                              the SBC "lumpy" bucket - see Key modeling assumptions), and
+                              a non-trending base for the erratic series (a trending base
+                              let AutoETS correctly-but-unhelpfully extrapolate an
+                              unbounded trend/interval across the forecast horizon)
 tests/                       pytest: classify thresholds, EBO math invariants, ingest
                               schema handling, end-to-end pipeline smoke tests, a
                               regression guard that a trending+seasonal SKU's forecast
@@ -133,11 +141,26 @@ tests/                       pytest: classify thresholds, EBO math invariants, i
   seasonality. A flat forecast is still correct output for SKUs where it wins the
   backtest (i.e. demand timing is genuinely unpredictable) - MAPE makes that verifiable
   instead of assumed.
+- `backtest._holdout_length` reserves at most ~25% of a SKU's history for the holdout
+  (capped at one seasonal cycle), NOT a full season. A full-season holdout was tried and
+  reverted: for a 36-month series it starves backtest training down to exactly 2
+  seasonal cycles, and AutoETS's own AICc model search sometimes cannot yet statistically
+  justify a seasonal component with only 2 cycles for a sparse (mostly-zero) intermittent/
+  lumpy series - even though the identical model, refit on a 3rd cycle, correctly detects
+  it. This was the actual root cause of intermittent/lumpy SKUs with real recurring
+  seasonal spikes still getting a flat forecast despite the MAPE-driven selection above
+  being implemented correctly - the selection logic was fine, the *holdout window*
+  systematically hid the very signal it was supposed to detect. Verified empirically in
+  `tests/test_scale_and_logging.py`-style debugging before landing the fix; do not widen
+  this back toward a full-season holdout without re-verifying against a sparse seasonal
+  fixture with only ~3 cycles of history.
 - MAPE is computed only over backtest periods with non-zero actuals (standard practice;
   otherwise it's undefined). `backtest_mae` and `n_backtest_periods` are reported
-  alongside it; `backtest_mape = NaN` means the SKU had too little history to backtest
-  (falls back to CrostonOptimized - the only candidate model verified safe on any
-  history length down to a single data point; see Robustness below).
+  alongside it; `backtest_mape = NaN` means either the SKU had too little history to
+  backtest (falls back to CrostonOptimized - the only candidate model verified safe on
+  any history length down to a single data point; see Robustness below) OR it was
+  eligible but its holdout window happened to contain zero non-zero actuals (falls back
+  to MAE-based selection instead, still model-driven, just not MAPE-scored).
 - Lead-time demand mean/variance scale linearly with lead-time periods
   (`mean_ltd = mean_per_period * lt_periods`, `var_ltd = var_per_period * lt_periods`),
   i.e. iid demand across periods within the lead time — the standard safety-stock

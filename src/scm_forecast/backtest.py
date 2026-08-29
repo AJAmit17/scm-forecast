@@ -43,9 +43,25 @@ FALLBACK_MODEL = "CrostonOptimized"
 SELECTION_COLUMNS = ["unique_id", "selected_model", "backtest_mape", "backtest_mae", "n_backtest_periods"]
 
 
-def _holdout_length(freq: str, horizon: int) -> int:
+def _holdout_length(freq: str, horizon: int, richest_history: int) -> int:
+    """Holdout window for the train/test backtest split.
+
+    Reserves at most ~25% of the richest available SKU history for the
+    holdout, capped at one seasonal cycle. A *full-season* holdout was tried
+    and reverted: for a 36-month series it starves backtest training down to
+    exactly 2 seasonal cycles, and AutoETS's own AICc model search sometimes
+    cannot yet statistically justify a seasonal component with only 2 cycles
+    for a sparse (mostly-zero) series - even though the SAME model, given a
+    3rd cycle, correctly detects it (verified empirically: h_eval=12 on 36
+    months of a genuinely seasonal lumpy SKU produced ETS(A,N,N) [flat];
+    h_eval=9, leaving 27 months / 2.25 cycles, correctly produced ETS(A,N,A)
+    [seasonal]). Reserving only a quarter of history keeps enough cycles for
+    a real seasonal pattern to be detected during backtest, not just when
+    the model is later refit on the full history for production.
+    """
     season_length = season_length_for_freq(freq)
-    return max(3, min(horizon, season_length, 6))
+    by_fraction = max(3, richest_history // 4)
+    return max(3, min(horizon, season_length, by_fraction))
 
 
 def _fit_model_safe(train_df: pd.DataFrame, model, freq: str, h_eval: int, n_jobs: int = 1) -> pd.DataFrame | None:
@@ -67,8 +83,9 @@ def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int, n_jobs: 
     if long_df.empty:
         return pd.DataFrame(columns=SELECTION_COLUMNS)
 
-    h_eval = _holdout_length(freq, horizon)
     lengths = long_df.groupby("unique_id")["ds"].count()
+    richest_history = int(lengths.max()) if len(lengths) else 0
+    h_eval = _holdout_length(freq, horizon, richest_history)
     eligible_ids = lengths[lengths >= MIN_TRAIN_PERIODS + h_eval].index.tolist()
     logger.info(
         "Backtest: %d/%d SKU(s) have enough history (>= %d periods) for a %d-period holdout.",
