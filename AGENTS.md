@@ -11,6 +11,19 @@ No external services, no API keys, no network calls at runtime. Everything
 runs locally against the uploaded file (statsforecast/scipy are pure local
 compute). `.env` is not used by this project.
 
+## Deployment (Streamlit Community Cloud)
+`runtime.txt` (`python-3.11`) and `packages.txt` (`libstdc++6`) at repo root are
+required for Streamlit Cloud specifically:
+- Without `runtime.txt`, Cloud picks the newest available Python (observed:
+  3.14), which is ahead of what statsforecast's compiled ARIMA extension
+  (`_lib.*.so`) has broadly-tested wheels for.
+- Without `libstdc++6`, importing that same compiled extension on Cloud's base
+  image fails with `undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE`
+  (the extension needs a newer libstdc++ than ships by default). This is a
+  Cloud-image issue, not an app bug - it does not reproduce locally under `uv`.
+If you change deployment target/runtime, re-verify this still resolves; do not
+remove these two files without confirming the import error is gone.
+
 ### Target input schema (real ERP/BI export)
 Monthly SKU demand history, one row per SKU x month:
 
