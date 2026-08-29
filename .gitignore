@@ -7,3 +7,4 @@ output/*.csv
 data/sample_demand.xlsx
 .streamlit/
 *.egg-info/
+.DS_Store
