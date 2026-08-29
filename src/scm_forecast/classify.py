@@ -16,6 +16,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from scm_forecast.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 ADI_CUTOFF = 1.32
 CV2_CUTOFF = 0.49
 
@@ -77,4 +81,8 @@ def compute_sku_stats(long_df: pd.DataFrame) -> pd.DataFrame:
                 "group": _group_for(category),
             }
         )
-    return pd.DataFrame.from_records(records)
+    stats_df = pd.DataFrame.from_records(records)
+    if not stats_df.empty:
+        counts = stats_df["category"].value_counts().to_dict()
+        logger.info("Classification: %d SKU(s) -> %s", len(stats_df), counts)
+    return stats_df

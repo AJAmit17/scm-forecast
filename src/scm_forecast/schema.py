@@ -44,3 +44,4 @@ class PipelineConfig:
     mode: str = "service_level"  # "service_level" | "budget"
     service_level: float = 0.95  # target cycle fill rate, used when mode == "service_level"
     budget: float | None = None  # total spares $ budget, used when mode == "budget"
+    n_jobs: int = 1  # statsforecast parallelism; keep 1 under Streamlit (see forecast.py/backtest.py)

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import typer
 
+from scm_forecast.logging_config import configure_console_logging
 from scm_forecast.pipeline import run_pipeline_from_path
 from scm_forecast.schema import ColumnMapping, PipelineConfig
 
@@ -34,7 +36,17 @@ def run(
     unit_cost_default: float = typer.Option(1.0, "--unit-cost-default"),
     service_level: float = typer.Option(0.95, "--service-level"),
     budget: float | None = typer.Option(None, "--budget", help="if set, switches to budget-constrained EBO minimization"),
+    jobs: int = typer.Option(
+        1, "--jobs", "-j",
+        help="statsforecast parallelism (1 = sequential, -1 = all cores). Process-pool "
+        "startup overhead (~seconds per model, paid repeatedly) means -1 is only worth it "
+        "for large SKU counts (hundreds+); it can be SLOWER for small files. Not exposed "
+        "in the Streamlit app - see AGENTS.md.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="DEBUG-level logging (default: INFO)"),
 ) -> None:
+    configure_console_logging(logging.DEBUG if verbose else logging.INFO)
+
     mapping = ColumnMapping(
         sku=sku_col,
         date=date_col,
@@ -52,6 +64,7 @@ def run(
         mode="budget" if budget is not None else "service_level",
         service_level=service_level,
         budget=budget,
+        n_jobs=jobs,
     )
 
     outputs = run_pipeline_from_path(str(input), mapping, config)

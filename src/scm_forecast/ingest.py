@@ -12,9 +12,14 @@ Handles two common real-world export quirks seen in ERP/BI pivot dumps:
 
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 
+from scm_forecast.logging_config import get_logger
 from scm_forecast.schema import ColumnMapping
+
+logger = get_logger(__name__)
 
 
 def read_input(path: str) -> pd.DataFrame:
@@ -71,11 +76,25 @@ def prepare_long_frame(
     if missing:
         raise ValueError(f"Missing required columns in input: {missing}")
 
+    start = time.perf_counter()
+    n_raw_rows = len(raw)
+    logger.info("Ingest: %d raw row(s) read.", n_raw_rows)
+    if n_raw_rows > 200_000:
+        logger.warning(
+            "Ingest: %d rows is a large input; this may take a while (SKU-level "
+            "backtesting/forecasting scales with the number of distinct SKUs, not rows).",
+            n_raw_rows,
+        )
+
     df = raw[[mapping.sku, mapping.date, mapping.qty]].copy()
     df.columns = ["unique_id", "ds_raw", "y"]
 
     df["unique_id"] = _clean_sku_id(df["unique_id"])
+    before_dropna = len(df)
     df = df.dropna(subset=["ds_raw", "unique_id"])  # drop blank spacer rows
+    dropped = before_dropna - len(df)
+    if dropped:
+        logger.info("Ingest: dropped %d blank spacer row(s) (no period and/or no SKU).", dropped)
 
     if mapping.date_format == "yymm":
         df["ds"] = _parse_yymm(df["ds_raw"])
@@ -84,6 +103,12 @@ def prepare_long_frame(
     df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0)
     df = df.drop(columns=["ds_raw"])
     df = df.groupby(["unique_id", "ds"], as_index=False)["y"].sum()
+
+    n_skus = df["unique_id"].nunique()
+    logger.info(
+        "Ingest: %d distinct SKU(s), date range %s -> %s.",
+        n_skus, df["ds"].min().date(), df["ds"].max().date(),
+    )
 
     frames = []
     for uid, g in df.groupby("unique_id", sort=False):
@@ -96,7 +121,10 @@ def prepare_long_frame(
         raise ValueError("No usable rows found after parsing sku/date/qty columns")
 
     long_df = pd.concat(frames, ignore_index=True)
-
+    logger.info(
+        "Ingest: gap-filled to %d row(s) across %d SKU(s) in %.2fs.",
+        len(long_df), n_skus, time.perf_counter() - start,
+    )
     attr_source_cols: dict[str, str] = {}
     if mapping.lead_time and mapping.lead_time in raw.columns:
         attr_source_cols["lead_time_days"] = mapping.lead_time

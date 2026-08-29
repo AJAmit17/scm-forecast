@@ -6,13 +6,13 @@ Run with: uv run streamlit run src/scm_forecast/app.py  (or `make app`)
 from __future__ import annotations
 
 import io
+import logging
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from scm_forecast.classify import compute_sku_stats
-from scm_forecast.ingest import prepare_long_frame
+from scm_forecast.logging_config import configure_streamlit_logging
 from scm_forecast.pipeline import run_pipeline
 from scm_forecast.schema import ColumnMapping, PipelineConfig
 
@@ -31,10 +31,25 @@ if uploaded is None:
     st.info("Upload a demand-history file to begin, or run `make sample-data` and upload `data/sample_demand.xlsx`.")
     st.stop()
 
-if uploaded.name.lower().endswith(".csv"):
-    raw = pd.read_csv(uploaded)
-else:
-    raw = pd.read_excel(uploaded)
+
+@st.cache_data(show_spinner="Parsing uploaded file...")
+def _load_raw(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Cached by (file content, filename): re-parsing a large Excel/CSV file on
+    every widget interaction (Streamlit reruns the whole script each time) is
+    wasteful for large uploads - this only re-parses when the file itself changes.
+    """
+    buf = io.BytesIO(file_bytes)
+    if filename.lower().endswith(".csv"):
+        return pd.read_csv(buf)
+    return pd.read_excel(buf)
+
+
+raw = _load_raw(uploaded.getvalue(), uploaded.name)
+if len(raw) > 50_000:
+    st.warning(
+        f"Large file: {len(raw):,} rows. Runtime scales with the number of distinct SKUs, "
+        "not row count - see the run log below after running for per-stage timing."
+    )
 
 st.subheader("Preview")
 st.dataframe(raw.head(20), width="stretch")
@@ -111,13 +126,19 @@ config = PipelineConfig(
 if not run_clicked:
     st.stop()
 
+log_handler = configure_streamlit_logging(logging.INFO)
 with st.spinner("Backtesting candidate models per SKU (MAPE) and fitting the winning forecast..."):
-    long_df, _attrs = prepare_long_frame(raw, mapping, config.freq)
-    stats_df = compute_sku_stats(long_df)
     outputs = run_pipeline(raw, mapping, config)
+    long_df = outputs.long_df
+    stats_df = outputs.stats
     forecast_df = outputs.forecast
     inventory_df = outputs.inventory
 
+with st.expander("Run log", expanded=log_handler.max_level >= logging.WARNING):
+    if log_handler.records:
+        st.code("\n".join(log_handler.records), language=None)
+    else:
+        st.caption("No log entries.")
 st.subheader("Demand-pattern classification")
 st.caption(
     "Informational only - the model that actually forecasts each SKU is chosen by holdout "

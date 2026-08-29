@@ -20,6 +20,8 @@ Output schema (per unique_id x ds over the forecast horizon):
 
 from __future__ import annotations
 
+import contextlib
+import os
 import warnings
 
 import numpy as np
@@ -27,6 +29,10 @@ import pandas as pd
 from scipy.stats import norm
 from statsforecast import StatsForecast
 from statsforecast.models import ADIDA, TSB, AutoARIMA, AutoETS, CrostonOptimized
+
+from scm_forecast.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 Z_80 = float(norm.ppf(0.9))  # 80% interval -> +/- 1.2816 sigma
 
@@ -47,10 +53,16 @@ def season_length_for_freq(freq: str) -> int:
 
 
 def build_candidate_models(season_length: int) -> list:
-    """Model pool evaluated per SKU by `backtest.backtest_and_select`."""
+    """Model pool evaluated per SKU by `backtest.backtest_and_select`.
+
+    `AutoARIMA(approximation=True)` uses a faster approximate likelihood for
+    order search - the dominant cost in the whole pipeline (~1.4x faster per
+    SKU, measured); the resulting order selection is occasionally a notch
+    less precise, an accepted tradeoff for batch forecasting at scale.
+    """
     return [
         AutoETS(season_length=season_length, alias="AutoETS"),
-        AutoARIMA(season_length=season_length, alias="AutoARIMA"),
+        AutoARIMA(season_length=season_length, alias="AutoARIMA", approximation=True),
         CrostonOptimized(alias="CrostonOptimized"),
         TSB(alpha_d=0.2, alpha_p=0.2, alias="TSB"),
         ADIDA(alias="ADIDA"),
@@ -94,6 +106,32 @@ def _naive_forecast(long_df: pd.DataFrame, freq: str, horizon: int) -> pd.DataFr
     return pd.DataFrame(rows, columns=FORECAST_ROW_COLUMNS)
 
 
+@contextlib.contextmanager
+def _suppress_model_fit_warnings():
+    """Suppress statsforecast's internal benign warnings (RuntimeWarning from
+    numpy divide-by-zero on short series, UserWarning from ARIMA optimizer
+    convergence, etc. - none of them indicate the fit we keep actually failed).
+
+    In-process `warnings.simplefilter`/`np.errstate` only cover `n_jobs=1`.
+    When `n_jobs != 1`, statsforecast parallelizes via joblib/loky worker
+    processes, which start with their own fresh warnings-filter state and do
+    NOT inherit the parent's `warnings.catch_warnings()` context - only the
+    inherited `PYTHONWARNINGS` environment variable reaches them, so that is
+    set (and restored) here too.
+    """
+    old_env = os.environ.get("PYTHONWARNINGS")
+    os.environ["PYTHONWARNINGS"] = "ignore"
+    try:
+        with warnings.catch_warnings(), np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        if old_env is None:
+            os.environ.pop("PYTHONWARNINGS", None)
+        else:
+            os.environ["PYTHONWARNINGS"] = old_env
+
+
 def _fit_group(
     df_slice: pd.DataFrame,
     model,
@@ -101,13 +139,13 @@ def _fit_group(
     freq: str,
     horizon: int,
     variance_lookup: pd.DataFrame,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """Fit `model` on `df_slice` in one StatsForecast call. Raises on failure -
     callers decide how to degrade (retry smaller batch, or fall back to naive).
     """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)  # benign near-zero-dof warnings on short series
-        sf = StatsForecast(models=[model], freq=freq, n_jobs=1)
+    with _suppress_model_fit_warnings():
+        sf = StatsForecast(models=[model], freq=freq, n_jobs=n_jobs)
         if model_name in INTERVAL_CAPABLE_MODELS:
             fcst = sf.forecast(df=df_slice, h=horizon, level=[80])
             fcst["forecast_mean"] = fcst[model_name].clip(lower=0)
@@ -130,6 +168,7 @@ def forecast_selected(
     horizon: int,
     stats_df: pd.DataFrame,
     selection_df: pd.DataFrame,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """Fit each SKU with the single model `selection_df` chose for it, on its full
     history (not the backtest train split), and return the per-period forecast.
@@ -156,17 +195,25 @@ def forecast_selected(
         model = models_by_name[model_name]
 
         try:
-            parts.append(_fit_group(subset, model, model_name, freq, horizon, variance_lookup))
+            parts.append(_fit_group(subset, model, model_name, freq, horizon, variance_lookup, n_jobs))
+            logger.info("Fit %s for %d SKU(s) in one batch.", model_name, group["unique_id"].nunique())
             continue
-        except Exception:
-            pass  # isolate per-SKU below rather than discarding the whole batch
+        except Exception as exc:
+            logger.warning(
+                "%s failed to fit as a batch for %d SKU(s) (%s: %s); retrying per-SKU.",
+                model_name, group["unique_id"].nunique(), type(exc).__name__, exc,
+            )
 
         naive_ids = []
         for uid in group["unique_id"]:
             one = subset[subset["unique_id"] == uid]
             try:
-                parts.append(_fit_group(one, model, model_name, freq, horizon, variance_lookup))
-            except Exception:
+                parts.append(_fit_group(one, model, model_name, freq, horizon, variance_lookup, n_jobs))
+            except Exception as exc:
+                logger.warning(
+                    "SKU %r: %s failed to fit (%s: %s); falling back to NaiveMean.",
+                    uid, model_name, type(exc).__name__, exc,
+                )
                 naive_ids.append(uid)
         if naive_ids:
             parts.append(_naive_forecast(subset[subset["unique_id"].isin(naive_ids)], freq, horizon))
@@ -174,7 +221,6 @@ def forecast_selected(
     if not parts:
         return pd.DataFrame(columns=FORECAST_ROW_COLUMNS)
     return pd.concat(parts, ignore_index=True)
-
 
 def zero_forecast(unique_ids: list[str], freq: str, horizon: int, last_dates: pd.Series) -> pd.DataFrame:
     """Placeholder horizon rows for SKUs with zero historical demand (no_demand group)."""

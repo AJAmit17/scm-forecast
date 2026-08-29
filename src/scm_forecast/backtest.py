@@ -14,7 +14,7 @@ Each candidate model is fit in its own StatsForecast call, wrapped in
 try/except: some models (notably AutoETS) hard-crash instead of skipping a
 pathological/degenerate series, and that must never take the other candidate
 models' results down with it - a model that fails on this batch is simply
-dropped from the comparison for this batch.
+dropped from the comparison for this batch (logged as a warning).
 
 SKUs with too little history for a meaningful holdout fall back to
 CrostonOptimized (the only candidate verified safe on any history length,
@@ -24,13 +24,18 @@ fallback explicit downstream.
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 import pandas as pd
 from statsforecast import StatsForecast
 
-from scm_forecast.forecast import build_candidate_models, season_length_for_freq
+from scm_forecast.forecast import (
+    _suppress_model_fit_warnings,
+    build_candidate_models,
+    season_length_for_freq,
+)
+from scm_forecast.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 MIN_TRAIN_PERIODS = 8
 FALLBACK_MODEL = "CrostonOptimized"
@@ -43,24 +48,32 @@ def _holdout_length(freq: str, horizon: int) -> int:
     return max(3, min(horizon, season_length, 6))
 
 
-def _fit_model_safe(train_df: pd.DataFrame, model, freq: str, h_eval: int) -> pd.DataFrame | None:
+def _fit_model_safe(train_df: pd.DataFrame, model, freq: str, h_eval: int, n_jobs: int = 1) -> pd.DataFrame | None:
     """Fit one candidate model on the holdout train split; None on any failure."""
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            sf = StatsForecast(models=[model], freq=freq, n_jobs=1)
+        with _suppress_model_fit_warnings():
+            sf = StatsForecast(models=[model], freq=freq, n_jobs=n_jobs)
             return sf.forecast(df=train_df, h=h_eval)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "%s failed to fit the backtest holdout batch (%s: %s); dropped from this batch's comparison.",
+            model.alias, type(exc).__name__, exc,
+        )
         return None
 
 
-def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int) -> pd.DataFrame:
+def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int, n_jobs: int = 1) -> pd.DataFrame:
     """One row per SKU: selected_model, backtest_mape, backtest_mae, n_backtest_periods."""
     if long_df.empty:
         return pd.DataFrame(columns=SELECTION_COLUMNS)
+
     h_eval = _holdout_length(freq, horizon)
     lengths = long_df.groupby("unique_id")["ds"].count()
     eligible_ids = lengths[lengths >= MIN_TRAIN_PERIODS + h_eval].index.tolist()
+    logger.info(
+        "Backtest: %d/%d SKU(s) have enough history (>= %d periods) for a %d-period holdout.",
+        len(eligible_ids), len(lengths), MIN_TRAIN_PERIODS + h_eval, h_eval,
+    )
 
     records: list[dict] = []
     if eligible_ids:
@@ -78,11 +91,12 @@ def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int) -> pd.Da
         fcst = None
         available_names: list[str] = []
         for model in models:
-            fcst_i = _fit_model_safe(train_df, model, freq, h_eval)
+            fcst_i = _fit_model_safe(train_df, model, freq, h_eval, n_jobs)
             if fcst_i is None:
                 continue
             available_names.append(model.alias)
             fcst = fcst_i if fcst is None else fcst.merge(fcst_i, on=["unique_id", "ds"], how="outer")
+        logger.info("Backtest: %d/%d candidate model(s) fit successfully: %s", len(available_names), len(models), available_names)
 
         if fcst is not None and available_names:
             scored = fcst.merge(test_df[["unique_id", "ds", "y"]], on=["unique_id", "ds"], how="inner")
@@ -119,6 +133,10 @@ def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int) -> pd.Da
     covered = set(result["unique_id"]) if not result.empty else set()
     missing = set(long_df["unique_id"].unique()) - covered
     if missing:
+        logger.info(
+            "Backtest: %d SKU(s) fall back to %s (too little history to backtest).",
+            len(missing), FALLBACK_MODEL,
+        )
         fallback = [
             {
                 "unique_id": uid,

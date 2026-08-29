@@ -74,7 +74,8 @@ CLI usage directly: `uv run scm-forecast --input <file> --output <forecast.csv> 
 ## Code layout
 ```
 src/scm_forecast/
-  schema.py     ColumnMapping (raw column -> pipeline role) + PipelineConfig (tunables)
+  schema.py     ColumnMapping (raw column -> pipeline role) + PipelineConfig (tunables,
+                incl. n_jobs)
   ingest.py     Excel/CSV -> canonical long frame (unique_id, ds, y), gap-filled with
                 explicit zero-demand periods; extracts per-SKU static attributes
                 (lead_time_days, unit_cost, current_stock)
@@ -84,12 +85,12 @@ src/scm_forecast/
                 model forecasts a SKU. Also computes the compound-Bernoulli
                 decomposition (p, mu_z, sigma_z) reused for variance estimation.
   backtest.py   Per-SKU holdout backtest: fits every candidate model
-                (`forecast.build_candidate_models`) on a train/holdout split, scores
-                each by MAPE (over non-zero-actual periods; MAE fallback when a SKU's
-                holdout window is all zero), and picks the single best model per SKU.
-                SKUs with too little history to backtest fall back to a demand-pattern
-                heuristic (AutoETS for "regular", CrostonOptimized for "intermittent")
-                with `backtest_mape = NaN` so that fallback is visible, not silent.
+                (`forecast.build_candidate_models`) in its own StatsForecast call (isolated
+                try/except - one model failing never drops the others), scores each by MAPE
+                (over non-zero-actual periods; MAE fallback when a SKU's holdout window is
+                all zero), and picks the single best model per SKU. SKUs with too little
+                history to backtest fall back to CrostonOptimized (verified safe on any
+                history length) with `backtest_mape = NaN` so that fallback is visible.
   forecast.py   Candidate pool: AutoETS, AutoARIMA (native 80% interval -> std) and
                 CrostonOptimized, TSB, ADIDA (compound-Bernoulli variance, since native
                 prediction intervals for these aren't reliably available without extra
@@ -100,14 +101,21 @@ src/scm_forecast/
                 Poisson (var<=mean) approximation of lead-time demand; EBO(s) curve;
                 either per-SKU service-level stock recommendation or budget-constrained
                 greedy marginal allocation across SKUs (classic METRIC marginal analysis).
+  logging_config.py  Central logging setup: console handler for the CLI, in-memory
+                handler for the Streamlit "Run log" panel. Every other module logs via
+                `get_logger(__name__)`; this module only decides routing (see Observability
+                below).
   pipeline.py   Orchestrates ingest -> classify -> backtest+select -> per-period forecast
-                -> lead-time scaling -> EBO. Returns `PipelineOutputs(forecast, inventory)`:
-                `forecast` = per-SKU-per-period curve (the actual forecast deliverable),
-                `inventory` = per-SKU EBO/stock-recommendation table.
-  cli.py        Typer CLI wrapping pipeline.run_pipeline_from_path; writes both CSVs.
-  app.py        Streamlit UI: upload, column mapping, run, model-selection/MAPE table,
-                per-SKU forecast chart (real curve, not a repeated average), two CSV
-                downloads (forecast + inventory).
+                -> lead-time scaling -> EBO, with per-stage timing logged. Returns
+                `PipelineOutputs(forecast, inventory, long_df, stats)`: `forecast` = per-SKU-
+                per-period curve (the actual forecast deliverable), `inventory` = per-SKU
+                EBO/stock-recommendation table, `long_df`/`stats` = reusable ingest/
+                classification results so callers (the UI) never re-ingest.
+  cli.py        Typer CLI wrapping pipeline.run_pipeline_from_path; writes both CSVs;
+                `--verbose`/`-v` for DEBUG logs, `--jobs`/`-j` for statsforecast parallelism.
+  app.py        Streamlit UI: upload (cached via `st.cache_data`), column mapping, run,
+                model-selection/MAPE table, "Run log" expander, per-SKU forecast chart
+                (real curve, not a repeated average), two CSV downloads.
 scripts/generate_sample.py   synthetic demand generator (smooth/erratic/intermittent/
                               lumpy/trending-seasonal SKUs, Item/YYMM/YYQQ/Actuals schema)
 tests/                       pytest: classify thresholds, EBO math invariants, ingest
@@ -169,6 +177,75 @@ against this:
 SKU columns, negative quantities, constant/zero-variance demand, zero budget,
 and a batch mixing all of the above must all complete without raising.
 
+## Observability: logging (not print/vague errors)
+Every module logs via `logging_config.get_logger(__name__)` under the shared
+`scm_forecast` logger tree - never `print`. `logging_config.py` only decides
+ROUTING:
+- CLI: `configure_console_logging()` (called once, at the top of `cli.run`) -
+  plain-text lines to stderr; `--verbose`/`-v` switches INFO -> DEBUG.
+- Streamlit: `configure_streamlit_logging()` (called once per script run, in
+  `app.py`, right before `run_pipeline`) - an `InMemoryLogHandler` whose
+  contents are rendered in a "Run log" `st.expander`, auto-expanded if any
+  WARNING+ record was emitted. A Streamlit user may not have the launching
+  terminal visible, so this is the primary place they see diagnostics.
+
+What gets logged: `ingest.py` (raw/gap-filled row counts, SKU count, date
+range, dropped spacer rows), `classify.py` (category distribution),
+`backtest.py`/`forecast.py` (eligible-vs-fallback SKU counts, which candidate
+models fit successfully, and - at WARNING, with the SKU id and the real
+exception type/message - every time a model fails and a fallback kicks in),
+`pipeline.py` (per-stage wall-clock timing and a final summary). This is
+intentionally the OPPOSITE of statsforecast's own internal warnings (see
+below): those are noise about degenerate-but-harmless internal model-search
+states; ours are signal about what this app actually decided and why.
+
+**Never suppress a statsforecast/numpy warning without routing the same
+information through our own `logger.warning(...)` first** if it could
+plausibly indicate an accuracy/coverage problem - the goal is replacing vague
+noise with precise signal, not just going quiet.
+
+## Performance & scalability (large uploads)
+Runtime scales with **distinct SKU count**, not row count - 20,000 rows as
+500 SKUs x 40 months behaves very differently from 20,000 rows as 50 SKUs x
+400 months. Measured on a 10-core M-series machine, single-threaded
+(`n_jobs=1`, the default everywhere): 500 SKUs x 40 months (20,000 rows) ->
+~80s end to end, dominated by `AutoARIMA` (the only candidate model with a
+real per-series optimization cost; the other four are near-instant).
+
+What's already done for this:
+- `AutoARIMA(approximation=True)` in `forecast.build_candidate_models` -
+  ~1.4x faster order search, no multiprocessing risk, on by default everywhere.
+- `PipelineConfig.n_jobs` (default `1`) threads through to every
+  `StatsForecast(...)` call. The CLI exposes `--jobs`/`-j` (still defaults to
+  `1`): measured, `-1` (all cores) only gave ~12% net improvement on the
+  500-SKU benchmark above, because this codebase makes several *separate*
+  `StatsForecast` calls (one per candidate model in the backtest, one per
+  winning-model group in the final fit) - each pays its own process-pool
+  spawn/teardown cost (~seconds), which eats most of the parallel win and can
+  make **small** files slower, not faster. Only worth trying `--jobs -1` for
+  genuinely large SKU counts (hundreds+); benchmark before relying on it.
+- The Streamlit app does NOT expose `n_jobs` and never uses anything but `1`:
+  `n_jobs=-1` previously reproduced a `concurrent.futures.process.
+  BrokenProcessPool` crash specifically under Streamlit's script-rerun
+  execution model (forking/spawning inside its own execution loop is
+  unsafe). Do not re-enable multiprocessing in `app.py` without re-verifying
+  that failure mode is actually gone.
+- `app.py` caches the uploaded file parse with `st.cache_data` (keyed on file
+  bytes + name) so Streamlit's "rerun the whole script on every widget
+  interaction" behavior doesn't re-parse a large Excel file on every click.
+- `PipelineOutputs` carries `long_df`/`stats` so the UI never calls
+  `prepare_long_frame`/`compute_sku_stats` a second time after `run_pipeline`
+  already did (previously an accidental double-ingest).
+- A `> 200,000` raw-row ingest and a `> 50,000` raw-row Streamlit upload both
+  log/display an explicit heads-up rather than silently taking a long time.
+
+If real usage needs faster large-batch throughput beyond this, the next lever
+is restructuring backtest/forecast to fit ALL candidate models in one shared
+`StatsForecast(models=[...])` call (one process pool instead of five) - this
+was deliberately NOT done here because it reintroduces the "one bad model
+crashes the whole batch" failure mode Robustness above fixes; do not make
+that tradeoff without re-adding the same per-model isolation some other way.
+
 ## Extending
 - New candidate model: add it in `forecast.py::build_candidate_models` with an explicit
   `alias`; add it to `INTERVAL_CAPABLE_MODELS` if it supports native `level=` intervals,
@@ -181,3 +258,11 @@ and a batch mixing all of the above must all complete without raising.
 - No network access needed for tests (statsforecast fits are local/CPU).
 - `tests/test_pipeline.py` fits real candidate models incl. a backtest holdout split;
   keep synthetic fixtures small when adding more end-to-end tests.
+- `tests/test_edge_cases.py`: malformed/pathological input must never crash the
+  pipeline (see Robustness above).
+- `tests/test_scale_and_logging.py`: no statsforecast warnings may leak out of
+  `run_pipeline` (asserted via `warnings.catch_warnings(record=True)`), structured
+  log milestones must be present (via `caplog`), and a moderate multi-SKU batch
+  (60 SKUs) must complete cleanly - this is the fastest regression signal for the
+  two failure modes reported against the deployed app; extend it rather than
+  re-deriving ad hoc repro scripts if a similar issue resurfaces.
