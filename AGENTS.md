@@ -263,6 +263,25 @@ that tradeoff without re-adding the same per-model isolation some other way.
 - `tests/test_scale_and_logging.py`: no statsforecast warnings may leak out of
   `run_pipeline` (asserted via `warnings.catch_warnings(record=True)`), structured
   log milestones must be present (via `caplog`), and a moderate multi-SKU batch
-  (60 SKUs) must complete cleanly - this is the fastest regression signal for the
-  two failure modes reported against the deployed app; extend it rather than
-  re-deriving ad hoc repro scripts if a similar issue resurfaces.
+  (60 SKUs) must complete cleanly.
+- `tests/test_app_session_state.py`: drives `app.py` for real via
+  `streamlit.testing.v1.AppTest` (upload sample data, click Run, then select
+  every SKU in turn) - catches Streamlit-state bugs unit tests on `pipeline.py`
+  alone cannot see (see App state pitfall below). Extend this file rather than
+  re-deriving ad hoc repro scripts if a similar "works once, breaks on the next
+  click" issue resurfaces.
+
+## Streamlit app-state pitfall (read before touching app.py)
+`st.button(...)` only returns `True` in the exact script rerun its click
+triggered; every subsequent rerun - including one triggered by an unrelated
+widget like the "Select SKU" selectbox - it returns `False` again. Gating the
+results section behind `if not run_clicked: st.stop()` therefore wiped the
+*entire* results view (chart, tables, downloads) the instant a user selected
+any SKU other than whichever was already showing - which looked exactly like
+"every category except the default one is broken", even though `run_pipeline`
+itself was working correctly for every category. Fixed by persisting
+`PipelineOutputs` (+ the log handler's records) in `st.session_state` keyed
+independently of `run_clicked`, so any later rerun re-reads the same cached
+result instead of re-gating on the button. Any new top-level `st.stop()` or
+early-return added to `app.py` MUST be re-checked against this failure mode:
+trigger it, then interact with an unrelated widget, and confirm results stay.

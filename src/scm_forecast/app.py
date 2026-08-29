@@ -123,20 +123,29 @@ config = PipelineConfig(
     budget=budget if mode_label != "Target service level" else None,
 )
 
-if not run_clicked:
+if run_clicked:
+    log_handler = configure_streamlit_logging(logging.INFO)
+    with st.spinner("Backtesting candidate models per SKU (MAPE) and fitting the winning forecast..."):
+        outputs = run_pipeline(raw, mapping, config)
+    st.session_state["pipeline_outputs"] = outputs
+    st.session_state["log_records"] = log_handler.records
+    st.session_state["log_max_level"] = log_handler.max_level
+
+if "pipeline_outputs" not in st.session_state:
+    st.info("Configure options in the sidebar, then click **Run pipeline**.")
     st.stop()
 
-log_handler = configure_streamlit_logging(logging.INFO)
-with st.spinner("Backtesting candidate models per SKU (MAPE) and fitting the winning forecast..."):
-    outputs = run_pipeline(raw, mapping, config)
-    long_df = outputs.long_df
-    stats_df = outputs.stats
-    forecast_df = outputs.forecast
-    inventory_df = outputs.inventory
+outputs = st.session_state["pipeline_outputs"]
+long_df = outputs.long_df
+stats_df = outputs.stats
+forecast_df = outputs.forecast
+inventory_df = outputs.inventory
+log_records = st.session_state["log_records"]
+log_max_level = st.session_state["log_max_level"]
 
-with st.expander("Run log", expanded=log_handler.max_level >= logging.WARNING):
-    if log_handler.records:
-        st.code("\n".join(log_handler.records), language=None)
+with st.expander("Run log", expanded=log_max_level >= logging.WARNING):
+    if log_records:
+        st.code("\n".join(log_records), language=None)
     else:
         st.caption("No log entries.")
 st.subheader("Demand-pattern classification")
