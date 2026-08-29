@@ -3,8 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-output/*.csv
-data/sample_demand.xlsx
 .streamlit/
 *.egg-info/
 .DS_Store
