@@ -77,7 +77,7 @@ def run_pipeline(raw: pd.DataFrame, mapping: ColumnMapping, config: PipelineConf
 
     parts = []
     if not active_long_df.empty:
-        selection_df = backtest_and_select(active_long_df, config.freq, config.horizon, stats_df)
+        selection_df = backtest_and_select(active_long_df, config.freq, config.horizon)
         parts.append(forecast_selected(active_long_df, config.freq, config.horizon, stats_df, selection_df))
     else:
         selection_df = pd.DataFrame(

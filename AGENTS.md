@@ -128,7 +128,8 @@ tests/                       pytest: classify thresholds, EBO math invariants, i
 - MAPE is computed only over backtest periods with non-zero actuals (standard practice;
   otherwise it's undefined). `backtest_mae` and `n_backtest_periods` are reported
   alongside it; `backtest_mape = NaN` means the SKU had too little history to backtest
-  (falls back to the demand-pattern heuristic model).
+  (falls back to CrostonOptimized - the only candidate model verified safe on any
+  history length down to a single data point; see Robustness below).
 - Lead-time demand mean/variance scale linearly with lead-time periods
   (`mean_ltd = mean_per_period * lt_periods`, `var_ltd = var_per_period * lt_periods`),
   i.e. iid demand across periods within the lead time — the standard safety-stock
@@ -141,6 +142,32 @@ tests/                       pytest: classify thresholds, EBO math invariants, i
   reference rather than a drop-in dependency.
 - Budget-constrained allocation is a greedy marginal-analysis heuristic (integer greedy
   on backorder-reduction-per-dollar), not a certified-optimal knapsack solution.
+
+## Robustness against malformed/pathological input
+SKU ids are treated as opaque strings everywhere - any format survives
+(`"ABC-123"`, `"1234"`, mixed numeric/alphanumeric in the same column,
+leading zeros, whitespace-padded, even an empty string). `ingest._clean_sku_id`
+forward-fills merged-cell blanks, strips whitespace, and normalizes
+Excel's `123` -> `123.0` float rendering back to `"123"`.
+
+Per-SKU history length is NOT assumed to be uniform or "enough". Some
+statsforecast models - AutoETS in particular - hard-crash (uncaught
+`IndexError`/`NotImplementedError`) instead of gracefully skipping a
+pathologically short or degenerate series, and since models fit a whole batch
+of SKUs in one call, an uncaught crash for ONE SKU would otherwise take down
+forecasting for every other SKU in the file. Two independent layers guard
+against this:
+1. `backtest.py`'s fallback for SKUs with too little history to backtest
+   (`< MIN_TRAIN_PERIODS + h_eval` periods) is always `CrostonOptimized` -
+   verified safe on any history length down to n=1 - never AutoETS/AutoARIMA.
+2. `forecast.py::forecast_selected` still wraps every batch fit in
+   try/except; on failure it retries per-SKU to isolate exactly which SKU(s)
+   broke that model, and only those fall back to `_naive_forecast` (historical
+   mean/std, pure pandas, cannot fail on any numeric input) - every other SKU
+   in the batch keeps its real model and forecast.
+`tests/test_edge_cases.py` locks this in: single-data-point SKUs, mixed-dtype
+SKU columns, negative quantities, constant/zero-variance demand, zero budget,
+and a batch mixing all of the above must all complete without raising.
 
 ## Extending
 - New candidate model: add it in `forecast.py::build_candidate_models` with an explicit

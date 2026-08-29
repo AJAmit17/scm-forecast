@@ -20,6 +20,8 @@ Output schema (per unique_id x ds over the forecast horizon):
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -60,6 +62,68 @@ def _compound_bernoulli_variance(p: pd.Series, mu_z: pd.Series, sigma_z: pd.Seri
     return p * sigma_z**2 + p * (1 - p) * mu_z**2
 
 
+def _naive_forecast(long_df: pd.DataFrame, freq: str, horizon: int) -> pd.DataFrame:
+    """Bulletproof fallback: per-SKU historical mean/std repeated flat over the
+    horizon. No statsforecast dependency, cannot fail on any numeric input
+    (including a single data point). Used only when every attempt to fit a
+    candidate model to a SKU has failed, so that one pathological/degenerate
+    SKU degrades gracefully instead of crashing the whole run.
+    """
+    if long_df.empty:
+        return pd.DataFrame(columns=FORECAST_ROW_COLUMNS)
+
+    agg = long_df.groupby("unique_id")["y"].agg(["mean", "std", "count"]).reset_index()
+    agg["std"] = agg["std"].fillna(0.0)
+    agg.loc[agg["count"] < 2, "std"] = 0.0
+    last_dates = long_df.groupby("unique_id")["ds"].max()
+
+    rows = []
+    for row in agg.itertuples(index=False):
+        start = last_dates.loc[row.unique_id]
+        future = pd.date_range(start, periods=horizon + 1, freq=freq)[1:]
+        for ds in future:
+            rows.append(
+                {
+                    "unique_id": row.unique_id,
+                    "ds": ds,
+                    "forecast_mean": max(row.mean, 0.0),
+                    "forecast_std": max(row.std, 0.0),
+                    "model_used": "NaiveMean",
+                }
+            )
+    return pd.DataFrame(rows, columns=FORECAST_ROW_COLUMNS)
+
+
+def _fit_group(
+    df_slice: pd.DataFrame,
+    model,
+    model_name: str,
+    freq: str,
+    horizon: int,
+    variance_lookup: pd.DataFrame,
+) -> pd.DataFrame:
+    """Fit `model` on `df_slice` in one StatsForecast call. Raises on failure -
+    callers decide how to degrade (retry smaller batch, or fall back to naive).
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # benign near-zero-dof warnings on short series
+        sf = StatsForecast(models=[model], freq=freq, n_jobs=1)
+        if model_name in INTERVAL_CAPABLE_MODELS:
+            fcst = sf.forecast(df=df_slice, h=horizon, level=[80])
+            fcst["forecast_mean"] = fcst[model_name].clip(lower=0)
+            fcst["forecast_std"] = (
+                (fcst[f"{model_name}-hi-80"] - fcst[f"{model_name}-lo-80"]) / (2 * Z_80)
+            ).clip(lower=0)
+        else:
+            fcst = sf.forecast(df=df_slice, h=horizon)
+            fcst["forecast_mean"] = fcst[model_name].clip(lower=0)
+            fcst = fcst.merge(variance_lookup, on="unique_id", how="left")
+            variance = _compound_bernoulli_variance(fcst["p"], fcst["mu_z"], fcst["sigma_z"])
+            fcst["forecast_std"] = np.sqrt(variance.clip(lower=0))
+    fcst["model_used"] = model_name
+    return fcst[FORECAST_ROW_COLUMNS]
+
+
 def forecast_selected(
     long_df: pd.DataFrame,
     freq: str,
@@ -69,6 +133,13 @@ def forecast_selected(
 ) -> pd.DataFrame:
     """Fit each SKU with the single model `selection_df` chose for it, on its full
     history (not the backtest train split), and return the per-period forecast.
+
+    Some statsforecast models (notably AutoETS) hard-crash rather than skip a
+    pathologically short/degenerate series within a batch. A crash there must
+    never take down forecasting for every other SKU in the file: on failure,
+    this retries the failing model per-SKU to isolate exactly which SKU(s)
+    broke it, and only those fall back to `_naive_forecast` - every SKU that
+    fits fine keeps its real model.
     """
     if long_df.empty:
         return pd.DataFrame(columns=FORECAST_ROW_COLUMNS)
@@ -83,23 +154,22 @@ def forecast_selected(
         if subset.empty:
             continue
         model = models_by_name[model_name]
-        sf = StatsForecast(models=[model], freq=freq, n_jobs=1)
 
-        if model_name in INTERVAL_CAPABLE_MODELS:
-            fcst = sf.forecast(df=subset, h=horizon, level=[80])
-            fcst["forecast_mean"] = fcst[model_name].clip(lower=0)
-            fcst["forecast_std"] = (
-                (fcst[f"{model_name}-hi-80"] - fcst[f"{model_name}-lo-80"]) / (2 * Z_80)
-            ).clip(lower=0)
-        else:
-            fcst = sf.forecast(df=subset, h=horizon)
-            fcst["forecast_mean"] = fcst[model_name].clip(lower=0)
-            fcst = fcst.merge(variance_lookup, on="unique_id", how="left")
-            variance = _compound_bernoulli_variance(fcst["p"], fcst["mu_z"], fcst["sigma_z"])
-            fcst["forecast_std"] = np.sqrt(variance.clip(lower=0))
+        try:
+            parts.append(_fit_group(subset, model, model_name, freq, horizon, variance_lookup))
+            continue
+        except Exception:
+            pass  # isolate per-SKU below rather than discarding the whole batch
 
-        fcst["model_used"] = model_name
-        parts.append(fcst[FORECAST_ROW_COLUMNS])
+        naive_ids = []
+        for uid in group["unique_id"]:
+            one = subset[subset["unique_id"] == uid]
+            try:
+                parts.append(_fit_group(one, model, model_name, freq, horizon, variance_lookup))
+            except Exception:
+                naive_ids.append(uid)
+        if naive_ids:
+            parts.append(_naive_forecast(subset[subset["unique_id"].isin(naive_ids)], freq, horizon))
 
     if not parts:
         return pd.DataFrame(columns=FORECAST_ROW_COLUMNS)

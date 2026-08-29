@@ -10,12 +10,21 @@ only over periods with non-zero actuals to avoid division by zero) with MAE
 as a fallback when a SKU has no non-zero holdout periods, and returns the
 single best-backtesting model per SKU plus its error for transparency.
 
-SKUs with too little history for a meaningful holdout fall back to a
-demand-pattern heuristic (AutoETS for "regular", CrostonOptimized for
-"intermittent") with `backtest_mape = NaN` to make that explicit downstream.
+Each candidate model is fit in its own StatsForecast call, wrapped in
+try/except: some models (notably AutoETS) hard-crash instead of skipping a
+pathological/degenerate series, and that must never take the other candidate
+models' results down with it - a model that fails on this batch is simply
+dropped from the comparison for this batch.
+
+SKUs with too little history for a meaningful holdout fall back to
+CrostonOptimized (the only candidate verified safe on any history length,
+including a single data point) with `backtest_mape = NaN` to make that
+fallback explicit downstream.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -24,6 +33,7 @@ from statsforecast import StatsForecast
 from scm_forecast.forecast import build_candidate_models, season_length_for_freq
 
 MIN_TRAIN_PERIODS = 8
+FALLBACK_MODEL = "CrostonOptimized"
 
 SELECTION_COLUMNS = ["unique_id", "selected_model", "backtest_mape", "backtest_mae", "n_backtest_periods"]
 
@@ -33,11 +43,21 @@ def _holdout_length(freq: str, horizon: int) -> int:
     return max(3, min(horizon, season_length, 6))
 
 
-def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int, stats_df: pd.DataFrame) -> pd.DataFrame:
+def _fit_model_safe(train_df: pd.DataFrame, model, freq: str, h_eval: int) -> pd.DataFrame | None:
+    """Fit one candidate model on the holdout train split; None on any failure."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            sf = StatsForecast(models=[model], freq=freq, n_jobs=1)
+            return sf.forecast(df=train_df, h=h_eval)
+    except Exception:
+        return None
+
+
+def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int) -> pd.DataFrame:
     """One row per SKU: selected_model, backtest_mape, backtest_mae, n_backtest_periods."""
     if long_df.empty:
         return pd.DataFrame(columns=SELECTION_COLUMNS)
-
     h_eval = _holdout_length(freq, horizon)
     lengths = long_df.groupby("unique_id")["ds"].count()
     eligible_ids = lengths[lengths >= MIN_TRAIN_PERIODS + h_eval].index.tolist()
@@ -54,48 +74,55 @@ def backtest_and_select(long_df: pd.DataFrame, freq: str, horizon: int, stats_df
 
         season_length = season_length_for_freq(freq)
         models = build_candidate_models(season_length)
-        model_names = [m.alias for m in models]
-        sf = StatsForecast(models=models, freq=freq, n_jobs=1)
-        fcst = sf.forecast(df=train_df, h=h_eval)
-        scored = fcst.merge(test_df[["unique_id", "ds", "y"]], on=["unique_id", "ds"], how="inner")
 
-        for uid, g in scored.groupby("unique_id", sort=False):
-            actual = g["y"].to_numpy()
-            nonzero = actual > 0
-            mape_by_model: dict[str, float] = {}
-            mae_by_model: dict[str, float] = {}
-            for name in model_names:
-                pred = g[name].to_numpy()
-                mae_by_model[name] = float(np.mean(np.abs(actual - pred)))
-                if nonzero.any():
-                    mape_by_model[name] = float(
-                        np.mean(np.abs((actual[nonzero] - pred[nonzero]) / actual[nonzero])) * 100
-                    )
-            if mape_by_model:
-                best = min(mape_by_model, key=mape_by_model.get)
-                best_mape = mape_by_model[best]
-            else:
-                best = min(mae_by_model, key=mae_by_model.get)
-                best_mape = np.nan
-            records.append(
-                {
-                    "unique_id": uid,
-                    "selected_model": best,
-                    "backtest_mape": best_mape,
-                    "backtest_mae": mae_by_model[best],
-                    "n_backtest_periods": h_eval,
-                }
-            )
+        fcst = None
+        available_names: list[str] = []
+        for model in models:
+            fcst_i = _fit_model_safe(train_df, model, freq, h_eval)
+            if fcst_i is None:
+                continue
+            available_names.append(model.alias)
+            fcst = fcst_i if fcst is None else fcst.merge(fcst_i, on=["unique_id", "ds"], how="outer")
+
+        if fcst is not None and available_names:
+            scored = fcst.merge(test_df[["unique_id", "ds", "y"]], on=["unique_id", "ds"], how="inner")
+
+            for uid, g in scored.groupby("unique_id", sort=False):
+                actual = g["y"].to_numpy()
+                nonzero = actual > 0
+                mape_by_model: dict[str, float] = {}
+                mae_by_model: dict[str, float] = {}
+                for name in available_names:
+                    pred = g[name].to_numpy()
+                    mae_by_model[name] = float(np.mean(np.abs(actual - pred)))
+                    if nonzero.any():
+                        mape_by_model[name] = float(
+                            np.mean(np.abs((actual[nonzero] - pred[nonzero]) / actual[nonzero])) * 100
+                        )
+                if mape_by_model:
+                    best = min(mape_by_model, key=mape_by_model.get)
+                    best_mape = mape_by_model[best]
+                else:
+                    best = min(mae_by_model, key=mae_by_model.get)
+                    best_mape = np.nan
+                records.append(
+                    {
+                        "unique_id": uid,
+                        "selected_model": best,
+                        "backtest_mape": best_mape,
+                        "backtest_mae": mae_by_model[best],
+                        "n_backtest_periods": h_eval,
+                    }
+                )
 
     result = pd.DataFrame(records, columns=SELECTION_COLUMNS)
     covered = set(result["unique_id"]) if not result.empty else set()
     missing = set(long_df["unique_id"].unique()) - covered
     if missing:
-        group_lookup = stats_df.set_index("unique_id")["group"]
         fallback = [
             {
                 "unique_id": uid,
-                "selected_model": "AutoETS" if group_lookup.get(uid) == "regular" else "CrostonOptimized",
+                "selected_model": FALLBACK_MODEL,
                 "backtest_mape": np.nan,
                 "backtest_mae": np.nan,
                 "n_backtest_periods": 0,
